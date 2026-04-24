@@ -37,8 +37,12 @@ const PITCH_SUBTITLE =
   "Premium users who haven't updated their profile in the last one year";
 const YOUR_NAME_PLACEHOLDER = "<your name>";
 
-const HOOK_TEXT =
-  "This could be a good time to keep your profile updated, even if you are only passively open.";
+const HOOK_TEXT = [
+  "Based on your background, your profile falls into a high-demand segment on iimjobs.",
+  "We've noticed your profile hasn't been updated recently. An updated profile gets significantly better visibility with recruiters & helps you see a more relevant job feed.",
+  "I just wanted to quickly help you refresh a few key details, so you don't miss out on relevant leadership opportunities.",
+  "It'll take under 2 minutes — shall we quickly update it now?",
+].join("\n\n");
 
 const PITCH_QUESTIONS = [
   "Are you currently actively exploring or just passively open to opportunities?",
@@ -428,7 +432,9 @@ export default function Home() {
               )}
             </PitchBlock>
 
-            <PitchBlock label="Hook">{HOOK_TEXT}</PitchBlock>
+            <PitchBlock label="Hook">
+              <span className="whitespace-pre-line">{HOOK_TEXT}</span>
+            </PitchBlock>
 
             <PitchBlock label="Quick Update Questions">
               <ul className="list-disc space-y-1 pl-5">
