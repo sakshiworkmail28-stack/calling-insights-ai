@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl *)",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(grep -qE \"Ready in|error|Error\" \"C:\\\\\\\\Users\\\\\\\\AGARWA~1.SAK\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\C--Users-agarwal-sakshi-calling-insights-ai-calling-insights-ai\\\\\\\\7c9d07fb-8d0a-4a87-930b-6da9618ec1de\\\\\\\\tasks\\\\\\\\bxvfmcahh.output\")",
+      "Bash(tail -30 \"C:\\\\\\\\Users\\\\\\\\AGARWA~1.SAK\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\C--Users-agarwal-sakshi-calling-insights-ai-calling-insights-ai\\\\\\\\7c9d07fb-8d0a-4a87-930b-6da9618ec1de\\\\\\\\tasks\\\\\\\\bxvfmcahh.output\")",
+      "Bash(tail *)",
+      "Bash(taskkill *)",
+      "Bash(git check-ignore *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
+    ]
+  }
+}
