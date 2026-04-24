@@ -243,7 +243,7 @@ export default function Home() {
   }
 
   return (
-    <div className="flex flex-1 bg-zinc-50 px-4 py-12 text-zinc-900">
+    <div className="flex min-h-screen flex-1 bg-zinc-50 px-4 py-12 text-zinc-900">
       <main className="mx-auto flex w-full max-w-3xl flex-col gap-8">
         <header>
           <h1 className="text-3xl font-semibold tracking-tight">
