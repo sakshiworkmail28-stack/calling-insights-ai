@@ -456,7 +456,7 @@ export default function Home() {
         )}
 
         <footer className="mt-auto pt-10 pb-4 text-center text-xs text-gray-400">
-          IIMJobs (InfoEdge India Pvt. Ltd.) | Powered by Sakshi(Marketing) :p
+          IIMJobs (InfoEdge India Pvt. Ltd.) | Powered by Sakshi(Marketing) 😛
         </footer>
       </main>
     </div>
