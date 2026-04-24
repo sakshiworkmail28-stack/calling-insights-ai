@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-pro";
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const MISSING_KEY_MESSAGE =
   "Gemini API key is missing. Please add GEMINI_API_KEY in .env.local.";
