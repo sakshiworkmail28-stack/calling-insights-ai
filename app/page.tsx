@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 type Candidate = {
   name: string;
@@ -31,6 +31,16 @@ type PitchCore = {
 type Faq = { q: string; a: string };
 
 const NOT_PROVIDED = "Not provided";
+
+const RETRY_HINT_DELAY_MS = 4000;
+const RETRYING_MESSAGE = "AI is temporarily busy. Retrying automatically...";
+const OVERLOAD_MESSAGE =
+  "AI services are currently under high load. Please retry in a moment.";
+
+function friendlyError(error: string | undefined, code: string | undefined) {
+  if (code === "overloaded") return OVERLOAD_MESSAGE;
+  return error ?? "Something went wrong.";
+}
 
 const PITCH_TITLE = "Calling Pitch – Reactivation (iimjobs profile update)";
 const PITCH_SUBTITLE =
@@ -117,6 +127,27 @@ export default function Home() {
   const [pitchLoading, setPitchLoading] = useState(false);
   const [pitchError, setPitchError] = useState<string | null>(null);
 
+  const [summaryRetrying, setSummaryRetrying] = useState(false);
+  const [pitchRetrying, setPitchRetrying] = useState(false);
+
+  useEffect(() => {
+    if (!summaryLoading) {
+      setSummaryRetrying(false);
+      return;
+    }
+    const t = setTimeout(() => setSummaryRetrying(true), RETRY_HINT_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [summaryLoading]);
+
+  useEffect(() => {
+    if (!pitchLoading) {
+      setPitchRetrying(false);
+      return;
+    }
+    const t = setTimeout(() => setPitchRetrying(true), RETRY_HINT_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [pitchLoading]);
+
   function resetDownstream() {
     setSummary(null);
     setSummaryError(null);
@@ -160,14 +191,16 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(candidate),
       });
-      const data: { summary?: ProfileSummary; error?: string } = await res
+      const data: {
+        summary?: ProfileSummary;
+        error?: string;
+        code?: string;
+      } = await res
         .json()
         .catch(() => ({ error: "Invalid server response." }));
 
       if (!res.ok || !data.summary) {
-        setSummaryError(
-          data.error ?? `Request failed with status ${res.status}.`,
-        );
+        setSummaryError(friendlyError(data.error, data.code));
         return;
       }
       setSummary(data.summary);
@@ -176,6 +209,7 @@ export default function Home() {
       setSummaryError(`Failed to generate summary: ${message}`);
     } finally {
       setSummaryLoading(false);
+      setSummaryRetrying(false);
     }
   }
 
@@ -193,14 +227,11 @@ export default function Home() {
           profileSummary: summary,
         }),
       });
-      const data: { pitch?: PitchCore; error?: string } = await res
-        .json()
-        .catch(() => ({ error: "Invalid server response." }));
+      const data: { pitch?: PitchCore; error?: string; code?: string } =
+        await res.json().catch(() => ({ error: "Invalid server response." }));
 
       if (!res.ok || !data.pitch) {
-        setPitchError(
-          data.error ?? `Request failed with status ${res.status}.`,
-        );
+        setPitchError(friendlyError(data.error, data.code));
         return;
       }
       setPitch(data.pitch);
@@ -209,6 +240,7 @@ export default function Home() {
       setPitchError(`Failed to generate sales pitch: ${message}`);
     } finally {
       setPitchLoading(false);
+      setPitchRetrying(false);
     }
   }
 
@@ -313,7 +345,9 @@ export default function Home() {
             </button>
             {summaryLoading && (
               <p className="mt-3 text-sm text-zinc-500">
-                Generating profile summary...
+                {summaryRetrying
+                  ? RETRYING_MESSAGE
+                  : "Generating profile summary..."}
               </p>
             )}
             {summaryError && (
@@ -377,7 +411,9 @@ export default function Home() {
             </button>
             {pitchLoading && (
               <p className="mt-3 text-sm text-zinc-500">
-                Generating sales pitch...
+                {pitchRetrying
+                  ? RETRYING_MESSAGE
+                  : "Generating sales pitch..."}
               </p>
             )}
             {pitchError && (

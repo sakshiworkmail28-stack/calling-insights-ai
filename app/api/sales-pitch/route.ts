@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
+import { callGemini } from "../_lib/gemini";
 
-const GEMINI_MODEL = "gemini-2.5-pro";
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const MISSING_KEY_MESSAGE =
   "Gemini API key is missing. Please add GEMINI_API_KEY in .env.local.";
 
@@ -36,14 +35,6 @@ type PitchCore = {
   insights: string;
 };
 
-type GeminiResponse = {
-  candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
-  }>;
-  promptFeedback?: { blockReason?: string };
-  error?: { message?: string };
-};
-
 export async function POST(request: NextRequest) {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === "PASTE_YOUR_GEMINI_API_KEY_HERE") {
@@ -70,73 +61,23 @@ export async function POST(request: NextRequest) {
 
   const prompt = buildPrompt({ input, summary });
 
-  let geminiRes: Response;
-  try {
-    geminiRes = await fetch(GEMINI_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.4 },
-      }),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown network error";
+  const result = await callGemini({
+    apiKey,
+    prompt,
+    temperature: 0.4,
+  });
+
+  if (!result.ok) {
     return Response.json(
-      { error: `Failed to reach Gemini API: ${message}` },
+      { error: result.message, code: result.code },
       { status: 502 },
     );
   }
 
-  const rawText = await geminiRes.text();
-  let data: GeminiResponse;
-  try {
-    data = JSON.parse(rawText) as GeminiResponse;
-  } catch {
-    return Response.json(
-      {
-        error: `Gemini API returned a non-JSON response (${geminiRes.status}).`,
-      },
-      { status: 502 },
-    );
-  }
-
-  if (!geminiRes.ok) {
-    const apiMessage = data?.error?.message ?? `HTTP ${geminiRes.status}`;
-    return Response.json(
-      { error: `Gemini API error: ${apiMessage}` },
-      { status: 502 },
-    );
-  }
-
-  if (data.promptFeedback?.blockReason) {
-    return Response.json(
-      {
-        error: `Gemini blocked the request: ${data.promptFeedback.blockReason}`,
-      },
-      { status: 502 },
-    );
-  }
-
-  const text = (data.candidates?.[0]?.content?.parts ?? [])
-    .map((p) => p?.text ?? "")
-    .join("")
-    .trim();
-
-  if (!text) {
-    return Response.json(
-      { error: "Gemini returned no text. Please try again." },
-      { status: 502 },
-    );
-  }
-
-  const pitch = parsePitchJson(text);
+  const pitch = parsePitchJson(result.text);
   if (!pitch) {
     return Response.json(
-      { error: "Could not parse Gemini response as JSON." },
+      { error: "Could not parse Gemini response as JSON.", code: "other" },
       { status: 502 },
     );
   }
