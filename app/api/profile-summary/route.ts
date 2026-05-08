@@ -4,6 +4,13 @@ import { callGemini } from "../_lib/gemini";
 const MISSING_KEY_MESSAGE =
   "Gemini API key is missing. Please add GEMINI_API_KEY in .env.local.";
 
+// Pro is mandatory here. Profile enrichment is the recruiter-grade path:
+// grounded LinkedIn matching, education extraction, and previous-experience
+// breakdown all degrade noticeably on Flash. Paid Gemini Pro stays the
+// only model — the gemini helper makes a single attempt with no fallback.
+const MODEL = "gemini-2.5-pro";
+const TIMEOUT_MS = 120_000;
+
 type RequestBody = {
   name?: string;
   company?: string;
@@ -25,64 +32,294 @@ type ProfileSummary = {
   profile_overview: string;
 };
 
+// Diagnostic envelope returned to the frontend so the temporary debug
+// panel can tell the user (and the operator looking at Vercel logs)
+// exactly which stage of the pipeline failed.
+type DebugInfo = {
+  requestId: string;
+  model: string;
+  timeoutMs: number;
+  stage: string;
+  elapsedMs: number;
+  errorType?: string;
+};
+
+type Tracker = {
+  requestId: string;
+  startedAt: number;
+  stage: string;
+};
+
+function generateRequestId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c && typeof c.randomUUID === "function") {
+    return c.randomUUID().replace(/-/g, "").slice(0, 12);
+  }
+  return Math.random().toString(36).slice(2, 14);
+}
+
+function makeTracker(): Tracker {
+  return { requestId: generateRequestId(), startedAt: Date.now(), stage: "0" };
+}
+
+function elapsed(tracker: Tracker): number {
+  return Date.now() - tracker.startedAt;
+}
+
+function formatValue(v: unknown): string {
+  if (typeof v === "string") return JSON.stringify(v);
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (v === null || v === undefined) return String(v);
+  return JSON.stringify(v);
+}
+
+function logStage(
+  tracker: Tracker,
+  stage: string,
+  event: string,
+  extra: Record<string, unknown> = {},
+) {
+  tracker.stage = stage;
+  const parts = [
+    "[profile-summary]",
+    `stage=${stage}`,
+    `event=${event}`,
+    `requestId=${tracker.requestId}`,
+    `elapsedMs=${elapsed(tracker)}`,
+  ];
+  for (const [k, v] of Object.entries(extra)) {
+    parts.push(`${k}=${formatValue(v)}`);
+  }
+  console.log(parts.join(" "));
+}
+
+function logError(
+  tracker: Tracker,
+  event: string,
+  err: unknown,
+  extra: Record<string, unknown> = {},
+) {
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  const parts = [
+    "[profile-summary]",
+    `stage=${tracker.stage}`,
+    `event=${event}`,
+    `requestId=${tracker.requestId}`,
+    `elapsedMs=${elapsed(tracker)}`,
+    `error=${formatValue(message)}`,
+  ];
+  for (const [k, v] of Object.entries(extra)) {
+    parts.push(`${k}=${formatValue(v)}`);
+  }
+  console.log(parts.join(" "));
+  if (stack) {
+    console.log(
+      `[profile-summary] requestId=${tracker.requestId} stage=${tracker.stage} stack=${formatValue(stack)}`,
+    );
+  }
+}
+
+function debugInfo(
+  tracker: Tracker,
+  errorType: string | undefined = undefined,
+): DebugInfo {
+  return {
+    requestId: tracker.requestId,
+    model: MODEL,
+    timeoutMs: TIMEOUT_MS,
+    stage: tracker.stage,
+    elapsedMs: elapsed(tracker),
+    errorType,
+  };
+}
+
+function errorResponse(
+  tracker: Tracker,
+  status: number,
+  message: string,
+  code: string,
+) {
+  const payload = { error: message, code, debug: debugInfo(tracker, code) };
+  logStage(tracker, "11", "frontend_response_returned", {
+    success: false,
+    httpStatus: status,
+    code,
+    payloadSize: JSON.stringify(payload).length,
+    totalDurationMs: elapsed(tracker),
+  });
+  return Response.json(payload, { status });
+}
+
 export async function POST(request: NextRequest) {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === "PASTE_YOUR_GEMINI_API_KEY_HERE") {
-    return Response.json({ error: MISSING_KEY_MESSAGE }, { status: 500 });
-  }
-
-  let body: RequestBody;
+  const tracker = makeTracker();
   try {
-    body = (await request.json()) as RequestBody;
-  } catch {
-    return Response.json({ error: "Invalid JSON body." }, { status: 400 });
+    let rawText: string;
+    try {
+      rawText = await request.text();
+    } catch (err) {
+      logError(tracker, "request_body_read_failed", err);
+      return errorResponse(tracker, 400, "Could not read request body.", "other");
+    }
+
+    // STAGE 1 — Incoming request received
+    logStage(tracker, "1", "request_received", {
+      rawInputLength: rawText.length,
+    });
+
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    if (!apiKey || apiKey === "PASTE_YOUR_GEMINI_API_KEY_HERE") {
+      logError(tracker, "missing_api_key", new Error("missing api key"));
+      return errorResponse(tracker, 500, MISSING_KEY_MESSAGE, "other");
+    }
+
+    let body: RequestBody;
+    try {
+      body = JSON.parse(rawText) as RequestBody;
+    } catch (err) {
+      logError(tracker, "invalid_request_json", err);
+      return errorResponse(tracker, 400, "Invalid JSON body.", "other");
+    }
+
+    const name = (body.name ?? "").trim();
+    if (!name) {
+      logError(tracker, "missing_name", new Error("name required"));
+      return errorResponse(tracker, 400, "Candidate name is required.", "other");
+    }
+
+    const parsedInput = {
+      name,
+      company: fallback(body.company),
+      designation: fallback(body.designation),
+      function: fallback(body.function),
+      experience: fallback(body.experience),
+    };
+
+    // STAGE 2 — Structured input parsed
+    logStage(tracker, "2", "parsed_input", {
+      name: parsedInput.name,
+      company: parsedInput.company,
+      designation: parsedInput.designation,
+      function: parsedInput.function,
+      experience: parsedInput.experience,
+    });
+
+    // STAGE 3 — Prompt construction started
+    const inputCharBudget = Object.values(parsedInput).join(" ").length;
+    logStage(tracker, "3", "prompt_construction_started", {
+      groundingEnabled: true,
+      estimatedInputLength: inputCharBudget,
+    });
+
+    let prompt: string;
+    try {
+      prompt = buildPrompt(parsedInput);
+    } catch (err) {
+      logError(tracker, "prompt_construction_failed", err);
+      return errorResponse(tracker, 500, "Prompt construction failed.", "other");
+    }
+
+    // STAGE 4 — Prompt construction completed
+    logStage(tracker, "4", "prompt_construction_completed", {
+      promptLength: prompt.length,
+      model: MODEL,
+      timeoutMs: TIMEOUT_MS,
+    });
+
+    // STAGES 5-8 are emitted from inside callGemini using the same requestId.
+    let result: Awaited<ReturnType<typeof callGemini>>;
+    try {
+      result = await callGemini({
+        apiKey,
+        prompt,
+        temperature: 0.2,
+        tools: [{ google_search: {} }],
+        model: MODEL,
+        requestId: tracker.requestId,
+      });
+    } catch (err) {
+      logError(tracker, "gemini_helper_threw", err);
+      return errorResponse(tracker, 502, "Gemini call failed.", "other");
+    }
+
+    if (!result.ok) {
+      // Carry the gemini-side stage forward into the route's tracker so the
+      // returned debug.stage points at the actual failure site.
+      tracker.stage = result.stage;
+      logError(tracker, "gemini_failed", new Error(result.message), {
+        code: result.code,
+        httpStatus: result.status,
+        geminiElapsedMs: result.elapsedMs,
+      });
+      const payload = {
+        error: result.message,
+        code: result.code,
+        debug: debugInfo(tracker, result.code),
+      };
+      logStage(tracker, "11", "frontend_response_returned", {
+        success: false,
+        httpStatus: 502,
+        code: result.code,
+        payloadSize: JSON.stringify(payload).length,
+        totalDurationMs: elapsed(tracker),
+      });
+      return Response.json(payload, { status: 502 });
+    }
+
+    // STAGE 9 — JSON extraction started
+    logStage(tracker, "9", "json_extraction_started", {
+      rawTextLength: result.text.length,
+    });
+
+    const summary = parseJsonFromText(result.text);
+    if (!summary) {
+      logError(tracker, "json_extraction_failed", new Error("could not parse JSON"), {
+        responsePreview: result.text.slice(0, 1000),
+      });
+      tracker.stage = "10";
+      const payload = {
+        error: "Could not parse Gemini response as JSON.",
+        code: "other",
+        debug: debugInfo(tracker, "json_parse"),
+      };
+      logStage(tracker, "11", "frontend_response_returned", {
+        success: false,
+        httpStatus: 502,
+        code: "other",
+        payloadSize: JSON.stringify(payload).length,
+        totalDurationMs: elapsed(tracker),
+      });
+      return Response.json(payload, { status: 502 });
+    }
+
+    const populatedFields = Object.values(summary).filter(
+      (v) => typeof v === "string" && v.trim().length > 0 && v !== "Not clearly found",
+    ).length;
+
+    // STAGE 10 — JSON extraction completed
+    logStage(tracker, "10", "json_extraction_completed", {
+      success: true,
+      extractedFieldsCount: populatedFields,
+      matchConfidence: summary.match_confidence,
+    });
+
+    const payload = { summary, debug: debugInfo(tracker) };
+    // STAGE 11 — Frontend response returned
+    logStage(tracker, "11", "frontend_response_returned", {
+      success: true,
+      httpStatus: 200,
+      payloadSize: JSON.stringify(payload).length,
+      totalDurationMs: elapsed(tracker),
+    });
+    return Response.json(payload);
+  } catch (err) {
+    // Catches unexpected runtime exceptions anywhere above. Vercel will
+    // separately log "Function execution timed out" if the platform itself
+    // killed us — combine that platform line with the last stage tag from
+    // this requestId to localize the failure.
+    logError(tracker, "unhandled_runtime_exception", err);
+    return errorResponse(tracker, 500, "Unexpected server error.", "other");
   }
-
-  const name = (body.name ?? "").trim();
-  if (!name) {
-    return Response.json(
-      { error: "Candidate name is required." },
-      { status: 400 },
-    );
-  }
-
-  const prompt = buildPrompt({
-    name,
-    company: fallback(body.company),
-    designation: fallback(body.designation),
-    function: fallback(body.function),
-    experience: fallback(body.experience),
-  });
-
-  // Pro is mandatory here. Profile enrichment is the recruiter-grade path:
-  // grounded LinkedIn matching, education extraction, and previous-experience
-  // breakdown all degrade noticeably on Flash. Paid Gemini Pro stays the
-  // primary; the helper falls back through 2.5-flash → 1.5-flash only on
-  // sustained overload.
-  const result = await callGemini({
-    apiKey,
-    prompt,
-    temperature: 0.2,
-    tools: [{ google_search: {} }],
-    model: "gemini-2.5-pro",
-  });
-
-  if (!result.ok) {
-    return Response.json(
-      { error: result.message, code: result.code },
-      { status: 502 },
-    );
-  }
-
-  const summary = parseJsonFromText(result.text);
-  if (!summary) {
-    return Response.json(
-      { error: "Could not parse Gemini response as JSON.", code: "other" },
-      { status: 502 },
-    );
-  }
-
-  return Response.json({ summary });
 }
 
 function fallback(value: string | undefined) {

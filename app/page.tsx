@@ -28,6 +28,32 @@ type PitchCore = {
   insights: string;
 };
 
+// Diagnostic envelope echoed by the profile-summary API so the temporary
+// debug panel can show which exact stage failed.
+type ApiDebug = {
+  requestId: string;
+  model: string;
+  timeoutMs: number;
+  stage: string;
+  elapsedMs: number;
+  errorType?: string;
+};
+
+const STAGE_LABELS: Record<string, string> = {
+  "0": "Init",
+  "1": "Request received",
+  "2": "Input parsed",
+  "3": "Prompt construction started",
+  "4": "Prompt construction completed",
+  "5": "Gemini request started",
+  "6": "Gemini headers received",
+  "7": "Gemini body received",
+  "8": "Grounding metadata extraction",
+  "9": "JSON extraction started",
+  "10": "JSON extraction completed",
+  "11": "Response returned",
+};
+
 type Faq = { q: string; a: string };
 
 const NOT_PROVIDED = "Not provided";
@@ -123,6 +149,7 @@ export default function Home() {
   const [summary, setSummary] = useState<ProfileSummary | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [summaryDebug, setSummaryDebug] = useState<ApiDebug | null>(null);
 
   const [pitch, setPitch] = useState<PitchCore | null>(null);
   const [pitchLoading, setPitchLoading] = useState(false);
@@ -131,6 +158,7 @@ export default function Home() {
   function resetDownstream() {
     setSummary(null);
     setSummaryError(null);
+    setSummaryDebug(null);
     setPitch(null);
     setPitchError(null);
   }
@@ -160,35 +188,69 @@ export default function Home() {
 
   async function handleGenerateSummary() {
     if (!candidate) return;
+    console.log("[frontend] event=button_clicked action=generate_profile_summary");
     setSummaryLoading(true);
     setSummaryError(null);
+    setSummaryDebug(null);
     setSummary(null);
     setPitch(null);
     setPitchError(null);
+    console.log("[frontend] event=loading_started action=profile_summary");
+    const startedAt = Date.now();
     try {
+      console.log(
+        "[frontend] event=request_started endpoint=/api/profile-summary",
+        { candidate },
+      );
       const res = await fetch("/api/profile-summary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(candidate),
       });
+      console.log(
+        `[frontend] event=response_received status=${res.status} elapsedMs=${Date.now() - startedAt}`,
+      );
       const data: {
         summary?: ProfileSummary;
         error?: string;
         code?: string;
+        debug?: ApiDebug;
       } = await res
         .json()
-        .catch(() => ({ error: "Invalid server response." }));
+        .catch((err) => {
+          console.error("[frontend] event=response_parse_failed", err);
+          return { error: "Invalid server response." };
+        });
+
+      if (data.debug) {
+        console.log("[frontend] event=debug_envelope", data.debug);
+        setSummaryDebug(data.debug);
+      }
 
       if (!res.ok || !data.summary) {
-        setSummaryError(friendlyError(data.error, data.code));
+        const message = friendlyError(data.error, data.code);
+        console.warn(
+          "[frontend] event=error_received endpoint=/api/profile-summary",
+          { status: res.status, code: data.code, error: data.error, debug: data.debug },
+        );
+        setSummaryError(message);
+        console.log("[frontend] event=retry_cta_shown action=profile_summary");
         return;
       }
+      console.log("[frontend] event=response_parse_success endpoint=/api/profile-summary", {
+        debug: data.debug,
+      });
       setSummary(data.summary);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Network error";
+      console.error("[frontend] event=request_threw endpoint=/api/profile-summary", err);
       setSummaryError(`Failed to generate summary: ${message}`);
+      console.log("[frontend] event=retry_cta_shown action=profile_summary");
     } finally {
       setSummaryLoading(false);
+      console.log(
+        `[frontend] event=loading_stopped action=profile_summary totalMs=${Date.now() - startedAt}`,
+      );
     }
   }
 
@@ -339,6 +401,9 @@ export default function Home() {
                   Retry Profile Summary
                 </button>
               </div>
+            )}
+            {summaryError && !summaryLoading && summaryDebug && (
+              <DebugPanel debug={summaryDebug} />
             )}
           </section>
         )}
@@ -493,6 +558,34 @@ export default function Home() {
           IIMJobs (InfoEdge India Pvt. Ltd.) | Powered by Sakshi(Marketing) 😛
         </footer>
       </main>
+    </div>
+  );
+}
+
+function DebugPanel({ debug }: { debug: ApiDebug }) {
+  const stageLabel = STAGE_LABELS[debug.stage] ?? `Stage ${debug.stage}`;
+  const elapsedSeconds = (debug.elapsedMs / 1000).toFixed(1);
+  const timeoutSeconds = Math.round(debug.timeoutMs / 1000);
+  return (
+    <div className="mt-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+      <div className="font-semibold uppercase tracking-wide">Debug Info</div>
+      <dl className="mt-1.5 grid grid-cols-1 gap-x-4 gap-y-0.5 sm:grid-cols-2">
+        <DebugRow label="Request ID" value={debug.requestId} />
+        <DebugRow label="Failed Stage" value={`${debug.stage} — ${stageLabel}`} />
+        <DebugRow label="Elapsed" value={`${elapsedSeconds}s`} />
+        <DebugRow label="Model" value={debug.model} />
+        <DebugRow label="Timeout" value={`${timeoutSeconds}s`} />
+        <DebugRow label="Error Type" value={debug.errorType ?? "—"} />
+      </dl>
+    </div>
+  );
+}
+
+function DebugRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex gap-2">
+      <dt className="font-medium">{label}:</dt>
+      <dd className="font-mono">{value}</dd>
     </div>
   );
 }
