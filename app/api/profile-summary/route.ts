@@ -4,11 +4,11 @@ import { callGemini } from "../_lib/gemini";
 const MISSING_KEY_MESSAGE =
   "Gemini API key is missing. Please add GEMINI_API_KEY in .env.local.";
 
-// Pro is mandatory here. Profile enrichment is the recruiter-grade path:
-// grounded LinkedIn matching, education extraction, and previous-experience
-// breakdown all degrade noticeably on Flash. Paid Gemini Pro stays the
-// only model — the gemini helper makes a single attempt with no fallback.
-const MODEL = "gemini-2.5-pro";
+// Flash with Google Search grounding is the right tradeoff here: Pro gave
+// marginally better enrichment but 2-3x the latency on grounded calls,
+// which made the recruiter UI feel broken. Flash + grounding stays inside
+// the request budget with acceptable quality.
+const MODEL = "gemini-2.5-flash";
 const TIMEOUT_MS = 120_000;
 
 type RequestBody = {

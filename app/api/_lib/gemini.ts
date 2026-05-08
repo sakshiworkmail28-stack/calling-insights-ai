@@ -1,19 +1,21 @@
 // Single-shot Gemini call. No automatic retries, no model fallback.
 //
-// Recruiter-grade routes (profile summary, sales pitch) MUST use
-// gemini-2.5-pro. Paid billing is enabled and Pro materially outperforms
-// Flash for grounded LinkedIn-style enrichment, education extraction, and
-// previous-experience breakdowns. Falling back to Flash / 1.5 quietly
-// degraded output, so this helper deliberately does not do that — if Pro
-// fails, the caller surfaces a structured error and the user retries
-// manually from the UI.
+// Default model is gemini-2.5-flash. Pro was tried but latency was too
+// high for an interactive recruiter UI; Flash is fast enough and good
+// enough with grounding enabled. If a caller needs to override, pass
+// `model` in options.
 //
 // This file is heavily instrumented for Vercel-side observability. Every
 // call emits stage-tagged log lines keyed by requestId so a single failing
 // request can be traced end-to-end across route + helper.
 
-const DEFAULT_MODEL = "gemini-2.5-pro";
-const DEFAULT_MAX_OUTPUT_TOKENS = 800;
+const DEFAULT_MODEL = "gemini-2.5-flash";
+// Big enough that a fully populated profile-summary JSON (with multi-entry
+// education, multi-entry previous experience, and a 4–5 line overview) is
+// never truncated mid-response — truncation would break JSON parsing. The
+// model only emits as many tokens as it needs, so a generous cap costs
+// nothing on short outputs like the sales pitch.
+const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
 // Grounded Pro responses can occasionally take well over a minute. 120s
 // leaves room for slow grounded calls without letting the request hang

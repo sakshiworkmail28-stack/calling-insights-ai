@@ -61,15 +61,15 @@ export async function POST(request: NextRequest) {
 
   const prompt = buildPrompt({ input, summary });
 
-  // Pro is mandatory here. Sales-pitch context + insights ride on top of the
-  // profile summary; weak phrasing or generic insights from Flash directly hurt
-  // recruiter call quality. Keep paid Gemini Pro as the primary model and let
-  // the helper degrade only if Pro is sustainedly overloaded.
+  // Flash with Google Search grounding is the right tradeoff here: Pro gave
+  // marginally better enrichment but 2-3x the latency on grounded calls,
+  // which made the recruiter UI feel broken. Flash + grounding stays inside
+  // the request budget with acceptable quality.
   const result = await callGemini({
     apiKey,
     prompt,
     temperature: 0.4,
-    model: "gemini-2.5-pro",
+    model: "gemini-2.5-flash",
   });
 
   if (!result.ok) {
