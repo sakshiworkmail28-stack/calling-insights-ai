@@ -325,19 +325,6 @@ export async function callGemini(options: GeminiOptions): Promise<GeminiResult> 
   const candidates = body.candidates ?? [];
   const firstCandidate = candidates[0];
   const parts = firstCandidate?.content?.parts ?? [];
-  const grounding = firstCandidate?.groundingMetadata;
-
-  // STAGE 8 — grounding metadata extraction
-  console.log(
-    tag(requestId, "8", "grounding_metadata", {
-      model,
-      candidateCount: candidates.length,
-      partsCount: parts.length,
-      groundingChunks: grounding?.groundingChunks?.length ?? 0,
-      webSearchQueries: grounding?.webSearchQueries?.length ?? 0,
-      groundingSupports: grounding?.groundingSupports?.length ?? 0,
-    }),
-  );
 
   if (candidates.length === 0) {
     const elapsedMs = Date.now() - startedAt;

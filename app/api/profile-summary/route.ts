@@ -266,40 +266,22 @@ export async function POST(request: NextRequest) {
       return Response.json(payload, { status: 502 });
     }
 
-    // STAGE 9 — JSON extraction started
-    logStage(tracker, "9", "json_extraction_started", {
+    // STAGE 9 — Delimiter parse started
+    logStage(tracker, "9", "delimiter_parse_started", {
       rawTextLength: result.text.length,
     });
 
-    const summary = parseJsonFromText(result.text);
-    if (!summary) {
-      logError(tracker, "json_extraction_failed", new Error("could not parse JSON"), {
-        responsePreview: result.text.slice(0, 1000),
-      });
-      tracker.stage = "10";
-      const payload = {
-        error: "Could not parse Gemini response as JSON.",
-        code: "other",
-        debug: debugInfo(tracker, "json_parse"),
-      };
-      logStage(tracker, "11", "frontend_response_returned", {
-        success: false,
-        httpStatus: 502,
-        code: "other",
-        payloadSize: JSON.stringify(payload).length,
-        totalDurationMs: elapsed(tracker),
-      });
-      return Response.json(payload, { status: 502 });
-    }
+    // The delimiter parser is total — no "could not parse" branch. A totally
+    // malformed response yields all-"Not clearly found" fields rather than a
+    // 502, so the frontend can always render whatever Gemini returned.
+    const { summary, rawLength, separatorCount, populatedCount } =
+      parseDelimitedResponse(result.text, parsedInput.experience);
 
-    const populatedFields = Object.values(summary).filter(
-      (v) => typeof v === "string" && v.trim().length > 0 && v !== "Not clearly found",
-    ).length;
-
-    // STAGE 10 — JSON extraction completed
-    logStage(tracker, "10", "json_extraction_completed", {
-      success: true,
-      extractedFieldsCount: populatedFields,
+    // STAGE 10 — Delimiter parse completed
+    logStage(tracker, "10", "delimiter_parse_completed", {
+      rawLength,
+      separatorCount,
+      populatedCount,
       matchConfidence: summary.match_confidence,
     });
 
@@ -364,7 +346,6 @@ LinkedIn is the PRIMARY source of structured truth. Before summarizing, identify
 - Education (degree and institution from the Education section; include partial information such as just the institution if the degree is not visible).
 - Location (city, metro, or region from the location line).
 - Domain / function.
-- Total experience in years (derive from the Experience history if a number is not stated).
 Read the headline, About, Experience, Education, Location, and any activity or bio sections in full before concluding that any field is "not found".
 
 SECONDARY SOURCE FALLBACK
@@ -401,7 +382,6 @@ Apply this per field:
     · "BA Economics — Delhi University (2001–2004)"
   Include every detail the profile shows. Do not truncate to just the degree or just the institution when more is present.
 - location: return "City, Country" when both are visible; fall back to country alone only if the city is not visible.
-- experience: use the explicit number of years stated on the profile when available; otherwise derive it from the earliest to the latest visible Experience entry.
 
 NO REGRESSION RULE
 Do not reduce data quality. If detailed structured data is available, always return the detailed form rather than a simplified summary. Never collapse multiple concrete facts (several degrees, multiple prior roles, distinct business units) into one vague sentence.
@@ -427,7 +407,7 @@ FUZZY MATCHING RULES
 Allow small variations when deciding if a result describes the same person:
 - Role variants, for example: Head of Commerce ≈ Head of SMB Growth / Business Head / Growth Head / Commerce Lead. Marketing ≈ Brand / Growth / Performance / B2C Marketing. Sales ≈ Revenue / GTM / Business Development / Commercial. Product ≈ Product Strategy / Product Lead / Product Manager.
 - Company variants, for example: Naukri ≈ Info Edge ≈ Naukri.com. Google ≈ Google India ≈ Google LLC. Deutsche Telekom ≈ Deutsche Telekom Digital Labs.
-- Experience can vary by 1–3 years.
+- Years of experience can vary by 1–3 years across sources.
 - Location may vary within the same region.
 
 SOURCE PRIORITY
@@ -445,92 +425,121 @@ Pick the closest matching person from credible public sources and assign:
 - "low": only the name matches, results are ambiguous, or no credible public confirmation was found.
 
 OUTPUT FORMAT
-Return ONLY JSON. No prose, no code fences, no commentary. Use this exact shape:
+Return ONLY plain text. No JSON, no markdown, no code fences, no field labels (no "Name:", no "Education:"), no commentary before or after the response.
 
-{
-  "name": "",
-  "current_role_company": "",
-  "previous_experience": "",
-  "experience": "",
-  "education": "",
-  "location": "",
-  "domain_function": "",
-  "match_confidence": "",
-  "reason_for_confidence": "",
-  "profile_overview": ""
-}
+Emit EXACTLY 9 fields in the order listed below, separated by the literal delimiter >>>|| (three greater-than signs followed by two pipes — no spaces around it). That means the response contains exactly 8 occurrences of >>>|| and 9 field values.
+
+Field order (do not deviate, do not skip, do not rename):
+1. name
+2. current_role_company
+3. previous_experience
+4. education
+5. location
+6. domain_function
+7. match_confidence
+8. reason_for_confidence
+9. profile_overview
+
+Required shape:
+<name>>>>||<current_role_company>>>>||<previous_experience>>>>||<education>>>>||<location>>>>||<domain_function>>>>||<match_confidence>>>>||<reason_for_confidence>>>>||<profile_overview>
+
+Concrete example (one line for clarity; profile_overview may contain newlines):
+Ravi Mittal>>>||Head of Supply Chain at Reckitt Benckiser>>>||Not clearly found>>>||Not clearly found>>>||Gurgaon, India>>>||Purchase / Supply Chain / Logistics>>>||low>>>||Public search results did not yield a strong verifiable match>>>||Detailed profile overview here
+
+HARD OUTPUT RULES
+- Always emit all 9 fields, in this exact order. Never skip or reorder.
+- If a value is genuinely unavailable, write exactly: Not clearly found
+- Never write field labels — emit only the value.
+- Never wrap values in quotes. Never use JSON. Never use markdown. Never use bullet points. Never use code fences.
+- Use the literal separator >>>|| with no surrounding spaces.
+- Do not write any text before the first field's value or after the last field's value.
+- Newlines inside profile_overview are allowed; the >>>|| separator is the only field boundary.
 
 FIELD RULES
 - name: the best-matched candidate's name.
 - current_role_company: latest role and company from public results; fall back to input only if public results are missing.
-- previous_experience: previous company and role if clearly found from public sources, otherwise "Not clearly found".
-- experience: total years from public results if found; otherwise the input experience value.
+- previous_experience: previous companies and roles if clearly found from public sources, otherwise "Not clearly found".
 - education: from public results if clearly found, otherwise "Not clearly found".
 - location: from public results if clearly found, otherwise "Not clearly found".
 - domain_function: infer from role, company, and function (for example "B2B SaaS Sales", "Consumer Brand Marketing").
-- match_confidence: exactly "high", "medium", or "low".
+- match_confidence: exactly one of high, medium, or low (lowercase, no quotes).
 - reason_for_confidence: one short sentence explaining why this profile was matched and which sources or signals supported it.
 - profile_overview: a meaningful 4–5 line paragraph covering who the person appears to be, current role/company, domain/function, seniority, notable previous experience if found, and why the profile is relevant for a recruiter.
 
 PROFILE OVERVIEW TONE
-If match_confidence is "high" or "medium", write a confident summary grounded in the public findings. Build it from the fields you actually extracted (current role and company, previous experience, education, location, domain / function, seniority) — do not simply restate the input. Do not hedge with phrases like "summary is based on provided details only". Only when match_confidence is "low" should you note that public confirmation was limited.
+If match_confidence is high or medium, write a confident summary grounded in the public findings. Build it from the fields you actually extracted (current role and company, previous experience, education, location, domain / function, seniority) — do not simply restate the input. Do not hedge with phrases like "summary is based on provided details only". Only when match_confidence is low should you note that public confirmation was limited.
 
 FALLBACK
-If public information is insufficient, still return the JSON object. Populate fields from the input where sensible, set match_confidence to "low", and explain in reason_for_confidence that public confirmation was limited.
+If public information is insufficient, still return all 9 fields in the exact delimited format above. Populate fields from the input where sensible, set match_confidence to low, and explain in reason_for_confidence that public confirmation was limited.
 
 GENERAL RULES
 - Do not hallucinate. If something is not clearly found, write "Not clearly found".
 - Do not include raw search snippets.
 - Do not include junk text like "view profile", "Facebook", "500+ connections", or repeated search text.
-- Return JSON only.
+- Return plain text only, using the >>>|| separator.
 
 FINAL SELF-CHECK BEFORE RETURNING
-Before you emit the JSON, run this check on your own draft:
+Before you emit the response, run this check on your own draft:
 1. Re-read profile_overview and reason_for_confidence word by word.
-2. For every specific school, degree, prior company, prior role, city, country, or year you mention in either of those strings, confirm the same concrete fact also appears in the corresponding structured field (education, previous_experience, location, experience, current_role_company).
+2. For every specific school, degree, prior company, prior role, city, country, or year you mention in either of those strings, confirm the same concrete fact also appears in the corresponding structured field (education, previous_experience, location, current_role_company).
 3. If a structured field is currently "Not clearly found" but profile_overview or reason_for_confidence names specific values for it, MOVE those values into the structured field before returning. It is a contradiction for reason_for_confidence to claim education is "confirmed" while education is "Not clearly found".
 4. A structured field may only remain "Not clearly found" if neither profile_overview nor reason_for_confidence references any specific value for it.
-Only after this pass should you emit the final JSON.`;
+5. Confirm the response contains exactly 8 occurrences of the literal separator >>>|| (so 9 field values), in the required order, with no surrounding labels, JSON, or commentary.
+Only after this pass should you emit the final delimited text.`;
 }
 
-function parseJsonFromText(text: string): ProfileSummary | null {
+const FIELD_SEPARATOR = ">>>||";
+
+// Delimiter parser. Designed to never throw: even a totally malformed Gemini
+// response collapses to a ProfileSummary populated entirely with
+// "Not clearly found", which the frontend renders safely.
+//
+// Index → field mapping must match the OUTPUT FORMAT block in buildPrompt:
+//   0 name, 1 current_role_company, 2 previous_experience, 3 education,
+//   4 location, 5 domain_function, 6 match_confidence,
+//   7 reason_for_confidence, 8 profile_overview
+//
+// `experience` is no longer requested from Gemini; we fill it from the
+// candidate's input so the existing UI card still shows something useful.
+function parseDelimitedResponse(
+  text: string,
+  fallbackExperience: string,
+): { summary: ProfileSummary; rawLength: number; separatorCount: number; populatedCount: number } {
   let s = text.trim();
+  // Defensive: strip code fences if Gemini accidentally wraps the response.
   if (s.startsWith("```")) {
     s = s
-      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/^```[a-zA-Z]*\s*/i, "")
       .replace(/```\s*$/, "")
       .trim();
   }
-  const firstBrace = s.indexOf("{");
-  const lastBrace = s.lastIndexOf("}");
-  if (firstBrace === -1 || lastBrace <= firstBrace) return null;
-  const candidate = s.slice(firstBrace, lastBrace + 1);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-
-  const obj = parsed as Record<string, unknown>;
-  const keys: Array<keyof ProfileSummary> = [
-    "name",
-    "current_role_company",
-    "previous_experience",
-    "experience",
-    "education",
-    "location",
-    "domain_function",
-    "match_confidence",
-    "reason_for_confidence",
-    "profile_overview",
-  ];
-  const result = {} as ProfileSummary;
-  for (const k of keys) {
-    const v = obj[k];
-    result[k] = typeof v === "string" ? v : "Not clearly found";
-  }
-  return result;
+  const parts = s.split(FIELD_SEPARATOR).map((p) => p.trim());
+  const get = (i: number) => {
+    const v = parts[i];
+    return v && v.length > 0 ? v : "Not clearly found";
+  };
+  const summary: ProfileSummary = {
+    name: get(0),
+    current_role_company: get(1),
+    previous_experience: get(2),
+    education: get(3),
+    location: get(4),
+    domain_function: get(5),
+    match_confidence: get(6),
+    reason_for_confidence: get(7),
+    profile_overview: get(8),
+    experience:
+      fallbackExperience && fallbackExperience.trim().length > 0
+        ? fallbackExperience
+        : "Not clearly found",
+  };
+  const populatedCount = Object.values(summary).filter(
+    (v) => typeof v === "string" && v.trim().length > 0 && v !== "Not clearly found",
+  ).length;
+  return {
+    summary,
+    rawLength: text.length,
+    separatorCount: parts.length - 1,
+    populatedCount,
+  };
 }

@@ -49,8 +49,8 @@ const STAGE_LABELS: Record<string, string> = {
   "6": "Gemini headers received",
   "7": "Gemini body received",
   "8": "Grounding metadata extraction",
-  "9": "JSON extraction started",
-  "10": "JSON extraction completed",
+  "9": "Delimiter parse started",
+  "10": "Delimiter parse completed",
   "11": "Response returned",
 };
 
