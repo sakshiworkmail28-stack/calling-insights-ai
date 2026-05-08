@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 type Candidate = {
   name: string;
@@ -32,13 +32,14 @@ type Faq = { q: string; a: string };
 
 const NOT_PROVIDED = "Not provided";
 
-const RETRY_HINT_DELAY_MS = 4000;
-const RETRYING_MESSAGE = "AI is temporarily busy. Retrying automatically...";
 const OVERLOAD_MESSAGE =
-  "AI services are currently under high load. Please retry in a moment.";
+  "AI service is temporarily busy. Please retry in a moment.";
+const TIMEOUT_MESSAGE =
+  "AI request took too long to respond. Please retry.";
 
 function friendlyError(error: string | undefined, code: string | undefined) {
   if (code === "overloaded") return OVERLOAD_MESSAGE;
+  if (code === "timeout") return TIMEOUT_MESSAGE;
   return error ?? "Something went wrong.";
 }
 
@@ -127,27 +128,6 @@ export default function Home() {
   const [pitchLoading, setPitchLoading] = useState(false);
   const [pitchError, setPitchError] = useState<string | null>(null);
 
-  const [summaryRetrying, setSummaryRetrying] = useState(false);
-  const [pitchRetrying, setPitchRetrying] = useState(false);
-
-  useEffect(() => {
-    if (!summaryLoading) {
-      setSummaryRetrying(false);
-      return;
-    }
-    const t = setTimeout(() => setSummaryRetrying(true), RETRY_HINT_DELAY_MS);
-    return () => clearTimeout(t);
-  }, [summaryLoading]);
-
-  useEffect(() => {
-    if (!pitchLoading) {
-      setPitchRetrying(false);
-      return;
-    }
-    const t = setTimeout(() => setPitchRetrying(true), RETRY_HINT_DELAY_MS);
-    return () => clearTimeout(t);
-  }, [pitchLoading]);
-
   function resetDownstream() {
     setSummary(null);
     setSummaryError(null);
@@ -209,7 +189,6 @@ export default function Home() {
       setSummaryError(`Failed to generate summary: ${message}`);
     } finally {
       setSummaryLoading(false);
-      setSummaryRetrying(false);
     }
   }
 
@@ -240,7 +219,6 @@ export default function Home() {
       setPitchError(`Failed to generate sales pitch: ${message}`);
     } finally {
       setPitchLoading(false);
-      setPitchRetrying(false);
     }
   }
 
@@ -345,15 +323,22 @@ export default function Home() {
             </button>
             {summaryLoading && (
               <p className="mt-3 text-sm text-zinc-500">
-                {summaryRetrying
-                  ? RETRYING_MESSAGE
-                  : "Generating profile summary..."}
+                Generating profile summary...
               </p>
             )}
-            {summaryError && (
-              <p role="alert" className="mt-3 text-sm text-red-600">
-                {summaryError}
-              </p>
+            {summaryError && !summaryLoading && (
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <p role="alert" className="text-sm text-red-600">
+                  {summaryError}
+                </p>
+                <button
+                  type="button"
+                  onClick={handleGenerateSummary}
+                  className="inline-flex items-center justify-center rounded-md border border-red-600 bg-white px-3 py-1.5 text-xs font-medium text-red-700 transition-colors hover:bg-red-50"
+                >
+                  Retry Profile Summary
+                </button>
+              </div>
             )}
           </section>
         )}
@@ -411,15 +396,22 @@ export default function Home() {
             </button>
             {pitchLoading && (
               <p className="mt-3 text-sm text-zinc-500">
-                {pitchRetrying
-                  ? RETRYING_MESSAGE
-                  : "Generating sales pitch..."}
+                Generating sales pitch...
               </p>
             )}
-            {pitchError && (
-              <p role="alert" className="mt-3 text-sm text-red-600">
-                {pitchError}
-              </p>
+            {pitchError && !pitchLoading && (
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <p role="alert" className="text-sm text-red-600">
+                  {pitchError}
+                </p>
+                <button
+                  type="button"
+                  onClick={handleGeneratePitch}
+                  className="inline-flex items-center justify-center rounded-md border border-red-600 bg-white px-3 py-1.5 text-xs font-medium text-red-700 transition-colors hover:bg-red-50"
+                >
+                  Retry Sales Pitch
+                </button>
+              </div>
             )}
           </section>
         )}
