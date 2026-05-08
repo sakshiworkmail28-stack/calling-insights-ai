@@ -54,11 +54,17 @@ export async function POST(request: NextRequest) {
     experience: fallback(body.experience),
   });
 
+  // Pro is mandatory here. Profile enrichment is the recruiter-grade path:
+  // grounded LinkedIn matching, education extraction, and previous-experience
+  // breakdown all degrade noticeably on Flash. Paid Gemini Pro stays the
+  // primary; the helper falls back through 2.5-flash → 1.5-flash only on
+  // sustained overload.
   const result = await callGemini({
     apiKey,
     prompt,
     temperature: 0.2,
     tools: [{ google_search: {} }],
+    model: "gemini-2.5-pro",
   });
 
   if (!result.ok) {

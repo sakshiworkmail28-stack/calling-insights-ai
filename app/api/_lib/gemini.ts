@@ -1,7 +1,22 @@
-const PRIMARY_MODEL = "gemini-2.5-flash";
-const FALLBACK_MODEL = "gemini-1.5-flash";
+// Default model used when callers do not specify one.
+// Lightweight / general-purpose paths can stay on Flash for cost + latency.
+// Recruiter-grade paths (profile summary, sales pitch) MUST pass model: "gemini-2.5-pro"
+// because Pro materially improves grounded LinkedIn-style matching, education
+// extraction, and previous-experience enrichment vs. Flash.
+const DEFAULT_MODEL = "gemini-2.5-flash";
+
+// Per-model fallback chains. The first entry is the requested model; subsequent
+// entries are the cheaper / older models we'll try if the primary keeps failing
+// in a transient way (overload, 5xx, rate limit). Order matters: never start
+// below the requested tier, only degrade.
+const FALLBACK_CHAINS: Record<string, string[]> = {
+  "gemini-2.5-pro": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-flash"],
+  "gemini-2.5-flash": ["gemini-2.5-flash", "gemini-1.5-flash"],
+  "gemini-1.5-flash": ["gemini-1.5-flash"],
+};
+
 const RETRY_DELAYS_MS = [2000, 5000, 10000];
-const MAX_OUTPUT_TOKENS = 800;
+const DEFAULT_MAX_OUTPUT_TOKENS = 800;
 
 const endpoint = (model: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
@@ -17,12 +32,16 @@ export type GeminiOptions = {
   prompt: string;
   temperature: number;
   tools?: unknown[];
+  // Optional override. Defaults to gemini-2.5-flash. Pass "gemini-2.5-pro"
+  // for recruiter-grade enrichment paths (profile summary, sales pitch).
+  model?: string;
+  maxOutputTokens?: number;
 };
 
 export type GeminiErrorCode = "overloaded" | "blocked" | "other";
 
 export type GeminiResult =
-  | { ok: true; text: string }
+  | { ok: true; text: string; modelUsed: string; fallbackTriggered: boolean }
   | { ok: false; status: number; message: string; code: GeminiErrorCode };
 
 type Attempt =
@@ -48,7 +67,11 @@ function isTransient(status: number, message: string): boolean {
   );
 }
 
-async function callModel(model: string, options: GeminiOptions): Promise<Attempt> {
+async function callModel(
+  model: string,
+  options: GeminiOptions,
+  maxOutputTokens: number,
+): Promise<Attempt> {
   let res: Response;
   try {
     res = await fetch(endpoint(model), {
@@ -62,7 +85,7 @@ async function callModel(model: string, options: GeminiOptions): Promise<Attempt
         ...(options.tools ? { tools: options.tools } : {}),
         generationConfig: {
           temperature: options.temperature,
-          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          maxOutputTokens,
         },
       }),
     });
@@ -115,42 +138,75 @@ async function callModel(model: string, options: GeminiOptions): Promise<Attempt
 }
 
 export async function callGemini(options: GeminiOptions): Promise<GeminiResult> {
+  const requestedModel = options.model ?? DEFAULT_MODEL;
+  const chain = FALLBACK_CHAINS[requestedModel] ?? [requestedModel, DEFAULT_MODEL];
+  const maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  const startedAt = Date.now();
+
   let last: Attempt = {
     ok: false,
     status: 0,
     message: "No attempt made",
     transient: true,
   };
+  let totalRetries = 0;
+  let blocked = false;
 
-  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-    if (attempt > 0) {
-      await delay(RETRY_DELAYS_MS[attempt - 1]);
+  for (let i = 0; i < chain.length; i++) {
+    const model = chain[i];
+    const isPrimary = i === 0;
+
+    // Primary gets a retry budget for transient failures; fallbacks get a single
+    // shot to keep latency bounded.
+    const maxAttempts = isPrimary ? RETRY_DELAYS_MS.length + 1 : 1;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) {
+        totalRetries++;
+        await delay(RETRY_DELAYS_MS[attempt - 1]);
+      }
+      const result = await callModel(model, options, maxOutputTokens);
+      if (result.ok) {
+        const elapsedMs = Date.now() - startedAt;
+        const fallbackTriggered = !isPrimary;
+        console.log(
+          `[gemini] ok requested=${requestedModel} used=${model} ` +
+            `fallback=${fallbackTriggered} retries=${totalRetries} elapsedMs=${elapsedMs}`,
+        );
+        return { ok: true, text: result.text, modelUsed: model, fallbackTriggered };
+      }
+      last = result;
+      if (result.blocked) {
+        blocked = true;
+        break;
+      }
+      if (!result.transient) break;
     }
-    const result = await callModel(PRIMARY_MODEL, options);
-    if (result.ok) return { ok: true, text: result.text };
-    last = result;
-    if (!result.transient) break;
+
+    // If the model was outright blocked (safety filter), don't try cheaper
+    // models — they'll block the same content. Bail early.
+    if (blocked) break;
   }
 
-  if (last.ok === false && last.blocked) {
-    return { ok: false, status: last.status, message: last.message, code: "blocked" };
-  }
-
-  const fallback = await callModel(FALLBACK_MODEL, options);
-  if (fallback.ok) return { ok: true, text: fallback.text };
-
-  const finalAttempt = fallback;
-  const lastWasTransient = last.ok === false && last.transient;
-  const code: GeminiErrorCode = finalAttempt.blocked
+  const elapsedMs = Date.now() - startedAt;
+  const lastErr = last.ok === false ? last : null;
+  const lastWasTransient = lastErr?.transient ?? false;
+  const code: GeminiErrorCode = blocked
     ? "blocked"
-    : finalAttempt.transient || lastWasTransient
+    : lastWasTransient
       ? "overloaded"
       : "other";
 
+  console.log(
+    `[gemini] fail requested=${requestedModel} chain=${chain.join(",")} ` +
+      `retries=${totalRetries} elapsedMs=${elapsedMs} code=${code} ` +
+      `message=${JSON.stringify(lastErr?.message ?? "unknown")}`,
+  );
+
   return {
     ok: false,
-    status: finalAttempt.status || 502,
-    message: finalAttempt.message,
+    status: lastErr?.status || 502,
+    message: lastErr?.message ?? "Unknown error",
     code,
   };
 }
