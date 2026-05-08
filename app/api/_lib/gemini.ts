@@ -11,9 +11,10 @@
 const DEFAULT_MODEL = "gemini-2.5-pro";
 const DEFAULT_MAX_OUTPUT_TOKENS = 800;
 
-// Grounded Pro responses can take 10-20s. 25s leaves headroom without
-// letting the request hang indefinitely.
-const REQUEST_TIMEOUT_MS = 25_000;
+// Grounded Pro responses can occasionally take well over a minute. 120s
+// leaves room for slow grounded calls without letting the request hang
+// indefinitely.
+const REQUEST_TIMEOUT_MS = 120_000;
 
 const endpoint = (model: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
