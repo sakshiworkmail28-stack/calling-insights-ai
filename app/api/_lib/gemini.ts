@@ -30,6 +30,7 @@ const endpoint = (model: string) =>
 type GeminiResponseBody = {
   candidates?: Array<{
     content?: { parts?: Array<{ text?: string }> };
+    finishReason?: string;
     groundingMetadata?: {
       groundingChunks?: unknown[];
       webSearchQueries?: unknown[];
@@ -325,42 +326,39 @@ export async function callGemini(options: GeminiOptions): Promise<GeminiResult> 
   const candidates = body.candidates ?? [];
   const firstCandidate = candidates[0];
   const parts = firstCandidate?.content?.parts ?? [];
+  const finishReason = firstCandidate?.finishReason;
+
+  // Soft-empty handling: HTTP 200 from Gemini that nevertheless contains no
+  // candidates, no content.parts, or only whitespace text gets returned to
+  // the caller as ok:true with empty text. The downstream delimiter parser
+  // turns an empty string into an all-"Not clearly found" summary, which the
+  // route's fallback fill + UI rendering both handle gracefully. This avoids
+  // the previous failure mode where a grounded response that contained only
+  // grounding metadata surfaced as a hard 502 to the user.
+  // Hard safety blocks remain error returns above — those are not soft.
 
   if (candidates.length === 0) {
     const elapsedMs = Date.now() - startedAt;
     console.log(
-      tag(requestId, "8", "gemini_empty_candidates", {
+      tag(requestId, "8", "gemini_empty_candidates_soft", {
         model,
         elapsedMs,
       }),
     );
-    return {
-      ok: false,
-      status: 502,
-      message: "Empty candidate array from Gemini.",
-      code: "other",
-      stage: "8",
-      elapsedMs,
-    };
+    return { ok: true, text: "", modelUsed: model, elapsedMs, stage: "8" };
   }
 
   if (parts.length === 0) {
     const elapsedMs = Date.now() - startedAt;
     console.log(
-      tag(requestId, "8", "gemini_missing_content_parts", {
+      tag(requestId, "8", "gemini_missing_content_parts_soft", {
         model,
         elapsedMs,
         candidateCount: candidates.length,
+        finishReason: finishReason ?? "unknown",
       }),
     );
-    return {
-      ok: false,
-      status: 502,
-      message: "Gemini response missing content.parts.",
-      code: "other",
-      stage: "8",
-      elapsedMs,
-    };
+    return { ok: true, text: "", modelUsed: model, elapsedMs, stage: "8" };
   }
 
   const text = parts
@@ -370,20 +368,14 @@ export async function callGemini(options: GeminiOptions): Promise<GeminiResult> 
   if (!text) {
     const elapsedMs = Date.now() - startedAt;
     console.log(
-      tag(requestId, "8", "gemini_empty_text", {
+      tag(requestId, "8", "gemini_empty_text_soft", {
         model,
         elapsedMs,
         partsCount: parts.length,
+        finishReason: finishReason ?? "unknown",
       }),
     );
-    return {
-      ok: false,
-      status: 502,
-      message: "Empty response from Gemini.",
-      code: "other",
-      stage: "8",
-      elapsedMs,
-    };
+    return { ok: true, text: "", modelUsed: model, elapsedMs, stage: "8" };
   }
 
   const elapsedMs = Date.now() - startedAt;
@@ -392,6 +384,7 @@ export async function callGemini(options: GeminiOptions): Promise<GeminiResult> 
       model,
       elapsedMs,
       bytes: text.length,
+      finishReason: finishReason ?? "unknown",
     }),
   );
   return { ok: true, text, modelUsed: model, elapsedMs, stage: "8" };

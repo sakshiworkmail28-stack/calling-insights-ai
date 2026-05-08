@@ -274,8 +274,19 @@ export async function POST(request: NextRequest) {
     // The delimiter parser is total — no "could not parse" branch. A totally
     // malformed response yields all-"Not clearly found" fields rather than a
     // 502, so the frontend can always render whatever Gemini returned.
-    const { summary, rawLength, separatorCount, populatedCount } =
+    const { summary: rawSummary, rawLength, separatorCount, populatedCount } =
       parseDelimitedResponse(result.text, parsedInput.experience);
+
+    // Post-parse fallback fill. If Gemini returned absolutely nothing usable
+    // (the soft-empty case from gemini.ts), the parser produced
+    // all-"Not clearly found" — give the UI something more meaningful than a
+    // wall of muted italics. We only touch the two fields that anchor the
+    // card visually (name + profile_overview); the rest stay as-is so the
+    // user can see exactly which fields the model couldn't fill.
+    const { summary, fallbacksApplied } = applyHardFallbacks(
+      rawSummary,
+      parsedInput.name,
+    );
 
     // STAGE 10 — Delimiter parse completed
     logStage(tracker, "10", "delimiter_parse_completed", {
@@ -283,6 +294,7 @@ export async function POST(request: NextRequest) {
       separatorCount,
       populatedCount,
       matchConfidence: summary.match_confidence,
+      fallbacksApplied,
     });
 
     const payload = { summary, debug: debugInfo(tracker) };
@@ -309,6 +321,49 @@ function fallback(value: string | undefined) {
   return trimmed.length > 0 ? trimmed : "Not provided";
 }
 
+// Post-parse fill for the empty-Gemini-response case. The prompt itself
+// instructs Gemini to emit these placeholders; this is a belt-and-braces
+// catch for the moments when Gemini returns nothing at all (e.g. grounded
+// response with only metadata). Only fills the two fields that visually
+// anchor the card so the user can still see whose summary they're looking
+// at — every other field stays at the parser's default so the UI clearly
+// shows what couldn't be found.
+function applyHardFallbacks(
+  summary: ProfileSummary,
+  candidateName: string,
+): { summary: ProfileSummary; fallbacksApplied: string[] } {
+  const isMissing = (v: string) =>
+    !v || v.trim().length === 0 || v === "Not clearly found";
+  const fallbacksApplied: string[] = [];
+
+  let name = summary.name;
+  if (isMissing(name) && candidateName.trim().length > 0) {
+    name = candidateName;
+    fallbacksApplied.push("name");
+  }
+
+  // "Everything missing" check uses the structured anchor fields. If both
+  // role/company and overview are missing, the response is effectively empty
+  // and the user deserves at least a one-line explanation.
+  const allEmpty =
+    isMissing(summary.current_role_company) &&
+    isMissing(summary.profile_overview) &&
+    isMissing(summary.previous_experience) &&
+    isMissing(summary.education) &&
+    isMissing(summary.location);
+
+  let profile_overview = summary.profile_overview;
+  if (allEmpty && candidateName.trim().length > 0) {
+    profile_overview = `No verified public information found for ${candidateName}.`;
+    fallbacksApplied.push("profile_overview");
+  }
+
+  return {
+    summary: { ...summary, name, profile_overview },
+    fallbacksApplied,
+  };
+}
+
 function buildPrompt(c: {
   name: string;
   company: string;
@@ -319,6 +374,15 @@ function buildPrompt(c: {
   return `You are an expert recruiter research assistant with access to Google Search grounding.
 
 Your job is to find the closest public profile match for the candidate described below and return a clean, structured summary. Treat the input as search guidance, not as ground truth.
+
+ABSOLUTE OUTPUT GUARANTEE (HIGHEST PRIORITY)
+You MUST emit a final structured textual response on every call. This rule overrides everything else in this prompt.
+- Never stop after Google Search lookups. Search results are a means, not the deliverable.
+- Never return only grounding metadata, only an explanation, or only a refusal.
+- Never return an empty answer, a partial answer, or fewer than 9 fields.
+- The deliverable is always the 9-field delimited text described in OUTPUT FORMAT — even when public information is sparse, ambiguous, or completely absent.
+- If exact matches are unavailable, produce best-effort field values from whatever publicly available information you can find, and use the placeholder strings in MANDATORY FALLBACK below for any field that has no usable data.
+- The structure must always exist. The delimiter must always exist. All 9 fields must always be present, in order.
 
 Candidate details:
 Name: ${c.name}
@@ -349,11 +413,15 @@ LinkedIn is the PRIMARY source of structured truth. Before summarizing, identify
 Read the headline, About, Experience, Education, Location, and any activity or bio sections in full before concluding that any field is "not found".
 
 SECONDARY SOURCE FALLBACK
-If the LinkedIn profile is missing, incomplete, or ambiguous for any specific field, search secondary sources to FILL the gap, not just to validate:
+If the LinkedIn profile is missing, incomplete, or ambiguous for any specific field, search secondary sources to FILL the gap, not just to validate. Cast a wide net:
 - Official company websites, leadership / team / about pages.
-- Press releases, news articles, interviews, and podcasts.
-- ZoomInfo, TheOrg, RocketReach.
-- Conference speaker bios, panel listings, author pages.
+- Press releases, news articles, interviews, podcasts, magazine features.
+- ZoomInfo, TheOrg, RocketReach, Crunchbase, AngelList, Bloomberg profiles.
+- Conference speaker bios, panel listings, author / paper / patent pages.
+- Public regulatory or legal records (e.g. director listings, MCA / SEC filings, court records).
+- Cached snippets, archived pages, alternate spellings, transliterations.
+- Role + company combinations (e.g. "<role> at <company>"), former-company / alias variants, social/public references that don't require login.
+Do not stop after weak search results. Continue generating a structured response using the best publicly available information.
 Every field that is still blank after LinkedIn must be attempted against at least one secondary source before giving up.
 
 EXTRACTION DEPTH
@@ -423,6 +491,17 @@ Pick the closest matching person from credible public sources and assign:
 - "high": name matches and either company or role (or both) clearly match, from a credible source.
 - "medium": name matches and either company or role is a close variant, but not both exact.
 - "low": only the name matches, results are ambiguous, or no credible public confirmation was found.
+
+MANDATORY FALLBACK (READ BEFORE EMITTING)
+If a field truly has no usable public data after every search strategy above, fill that field with one of these exact placeholder strings — never leave a field blank, never drop a field, never reduce the response below 9 delimiter-separated values:
+- name: if no public profile of any kind could be located, use the candidate's input name verbatim ("${c.name}") instead of "Not clearly found".
+- previous_experience: if nothing public was found, use exactly: No verified previous experience found
+- education: if nothing public was found, use exactly: No verified education information found
+- profile_overview: if nothing public was found at all, use exactly: No verified public information found for ${c.name}.
+- All other fields (current_role_company, location, domain_function, reason_for_confidence): use "Not clearly found" as the default fallback.
+- match_confidence: when public confirmation is missing, use exactly: low
+
+These fallbacks are ONLY for the case where research genuinely came up empty. Whenever even a partial fact is available, return that partial fact instead of the placeholder. The goal is "always 9 fields, in order, with the most useful value possible."
 
 OUTPUT FORMAT
 Return ONLY plain text. No JSON, no markdown, no code fences, no field labels (no "Name:", no "Education:"), no commentary before or after the response.
