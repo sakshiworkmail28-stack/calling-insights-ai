@@ -204,104 +204,95 @@ export async function POST(request: NextRequest) {
       experience: parsedInput.experience,
     });
 
-    // STAGE 3 — Prompt construction started
-    const inputCharBudget = Object.values(parsedInput).join(" ").length;
-    logStage(tracker, "3", "prompt_construction_started", {
-      groundingEnabled: true,
-      estimatedInputLength: inputCharBudget,
-    });
-
-    let prompt: string;
-    try {
-      prompt = buildPrompt(parsedInput);
-    } catch (err) {
-      logError(tracker, "prompt_construction_failed", err);
-      return errorResponse(tracker, 500, "Prompt construction failed.", "other");
-    }
-
-    // STAGE 4 — Prompt construction completed
-    logStage(tracker, "4", "prompt_construction_completed", {
-      promptLength: prompt.length,
-      model: MODEL,
-      timeoutMs: TIMEOUT_MS,
-    });
-
-    // STAGES 5-8 are emitted from inside callGemini using the same requestId.
-    let result: Awaited<ReturnType<typeof callGemini>>;
-    try {
-      result = await callGemini({
-        apiKey,
-        prompt,
-        temperature: 0.2,
-        tools: [{ google_search: {} }],
-        model: MODEL,
-        requestId: tracker.requestId,
-      });
-    } catch (err) {
-      logError(tracker, "gemini_helper_threw", err);
-      return errorResponse(tracker, 502, "Gemini call failed.", "other");
-    }
-
-    if (!result.ok) {
-      // Carry the gemini-side stage forward into the route's tracker so the
-      // returned debug.stage points at the actual failure site.
-      tracker.stage = result.stage;
-      logError(tracker, "gemini_failed", new Error(result.message), {
-        code: result.code,
-        httpStatus: result.status,
-        geminiElapsedMs: result.elapsedMs,
-      });
+    // First attempt — primary search strategy.
+    const first = await runGeminiAttempt(
+      tracker,
+      apiKey,
+      parsedInput,
+      "primary",
+      1,
+    );
+    if (!first.ok) {
+      tracker.stage = first.geminiStage;
       const payload = {
-        error: result.message,
-        code: result.code,
-        debug: debugInfo(tracker, result.code),
+        error: first.errorMessage,
+        code: first.errorCode,
+        debug: debugInfo(tracker, first.errorCode),
       };
       logStage(tracker, "11", "frontend_response_returned", {
         success: false,
         httpStatus: 502,
-        code: result.code,
+        code: first.errorCode,
         payloadSize: JSON.stringify(payload).length,
         totalDurationMs: elapsed(tracker),
       });
       return Response.json(payload, { status: 502 });
     }
 
-    // STAGE 9 — Delimiter parse started
-    logStage(tracker, "9", "delimiter_parse_started", {
-      rawTextLength: result.text.length,
-    });
+    let chosen = first;
+    let retryTriggered = false;
+    const retryReason = first.assessment.weakReason;
 
-    // The delimiter parser is total — no "could not parse" branch. A totally
-    // malformed response yields all-"Not clearly found" fields rather than a
-    // 502, so the frontend can always render whatever Gemini returned.
-    const { summary: rawSummary, rawLength, separatorCount, populatedCount } =
-      parseDelimitedResponse(result.text, parsedInput.experience);
+    // Silent backend retry — single shot, expanded search strategy. The
+    // frontend never sees this; it's a server-side quality improvement
+    // inside the same request lifecycle.
+    if (retryReason !== null) {
+      retryTriggered = true;
+      logStage(tracker, "10", "retry_triggered", {
+        retryReason,
+        retryAttempt: 1,
+        searchStrategy: "expanded",
+        firstAttemptScore: first.assessment.score,
+        firstAttemptConfidence: first.summary.match_confidence,
+        firstAttemptPopulated: first.assessment.populatedCount,
+      });
 
-    // Post-parse fallback fill. If Gemini returned absolutely nothing usable
-    // (the soft-empty case from gemini.ts), the parser produced
-    // all-"Not clearly found" — give the UI something more meaningful than a
-    // wall of muted italics. We only touch the two fields that anchor the
-    // card visually (name + profile_overview); the rest stay as-is so the
-    // user can see exactly which fields the model couldn't fill.
-    const { summary, fallbacksApplied } = applyHardFallbacks(
-      rawSummary,
-      parsedInput.name,
-    );
+      const second = await runGeminiAttempt(
+        tracker,
+        apiKey,
+        parsedInput,
+        "expanded",
+        2,
+      );
 
-    // STAGE 10 — Delimiter parse completed
-    logStage(tracker, "10", "delimiter_parse_completed", {
-      rawLength,
-      separatorCount,
-      populatedCount,
-      matchConfidence: summary.match_confidence,
-      fallbacksApplied,
-    });
+      if (!second.ok) {
+        // Retry's gemini call itself failed (network / timeout / blocked).
+        // Keep the first attempt's result rather than failing the whole
+        // request — the user's loader has been spinning and we have a usable
+        // (if weak) answer in hand.
+        logStage(tracker, "10", "retry_call_failed_kept_first", {
+          retryError: second.errorMessage,
+          retryCode: second.errorCode,
+        });
+      } else if (second.assessment.score > first.assessment.score) {
+        chosen = second;
+        logStage(tracker, "10", "retry_chose_second", {
+          firstScore: first.assessment.score,
+          secondScore: second.assessment.score,
+          firstConfidence: first.summary.match_confidence,
+          secondConfidence: second.summary.match_confidence,
+        });
+      } else {
+        // Retry didn't beat the first attempt. Stick with first.
+        logStage(tracker, "10", "retry_kept_first", {
+          firstScore: first.assessment.score,
+          secondScore: second.assessment.score,
+          firstConfidence: first.summary.match_confidence,
+          secondConfidence: second.summary.match_confidence,
+        });
+      }
+    }
 
-    const payload = { summary, debug: debugInfo(tracker) };
+    const payload = { summary: chosen.summary, debug: debugInfo(tracker) };
     // STAGE 11 — Frontend response returned
     logStage(tracker, "11", "frontend_response_returned", {
       success: true,
       httpStatus: 200,
+      retryTriggered,
+      retryReason: retryReason ?? "none",
+      finalScore: chosen.assessment.score,
+      finalConfidence: chosen.summary.match_confidence,
+      finalPopulated: chosen.assessment.populatedCount,
       payloadSize: JSON.stringify(payload).length,
       totalDurationMs: elapsed(tracker),
     });
@@ -319,6 +310,231 @@ export async function POST(request: NextRequest) {
 function fallback(value: string | undefined) {
   const trimmed = (value ?? "").trim();
   return trimmed.length > 0 ? trimmed : "Not provided";
+}
+
+type ParsedInput = {
+  name: string;
+  company: string;
+  designation: string;
+  function: string;
+  experience: string;
+};
+
+type QualityAssessment = {
+  // 0..7. Higher is better. Used to compare attempt #1 vs attempt #2.
+  score: number;
+  populatedCount: number;
+  // null = quality is acceptable; otherwise this is the retry trigger label
+  // surfaced to logs (low_confidence | no_verified_profile |
+  // insufficient_fields | weak_grounding).
+  weakReason:
+    | "low_confidence"
+    | "no_verified_profile"
+    | "insufficient_fields"
+    | "weak_grounding"
+    | null;
+};
+
+type AttemptOk = {
+  ok: true;
+  summary: ProfileSummary;
+  assessment: QualityAssessment;
+  fallbacksApplied: string[];
+};
+
+type AttemptFail = {
+  ok: false;
+  geminiStage: string;
+  errorMessage: string;
+  errorCode: string;
+};
+
+type AttemptOutcome = AttemptOk | AttemptFail;
+
+const WEAK_OVERVIEW_PHRASES =
+  /no verified public information|could not identify|public profile unavailable/i;
+
+const MISSING_FIELD_PHRASES =
+  /^(\s*not clearly found\s*)$|no verified (public information|previous experience|education information)/i;
+
+function looksMissing(value: string): boolean {
+  if (!value) return true;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return true;
+  return MISSING_FIELD_PHRASES.test(trimmed);
+}
+
+// Score the parsed summary on a coarse 0..7 scale and decide whether the
+// result is weak enough to justify a silent retry. The caller compares
+// scores between attempts to pick the better one.
+function assessQuality(
+  summary: ProfileSummary,
+  geminiTextEmpty: boolean,
+): QualityAssessment {
+  const confidence = (summary.match_confidence ?? "").toLowerCase().trim();
+  const overview = summary.profile_overview ?? "";
+
+  let score = 0;
+  if (confidence === "high") score += 3;
+  else if (confidence === "medium") score += 2;
+  else score += 1;
+  if (!looksMissing(summary.previous_experience)) score += 1;
+  if (!looksMissing(summary.education)) score += 1;
+  if (!looksMissing(summary.current_role_company)) score += 1;
+  if (overview.length > 120 && !/no verified public information/i.test(overview)) {
+    score += 1;
+  }
+
+  const populatedCount = [
+    summary.name,
+    summary.current_role_company,
+    summary.previous_experience,
+    summary.education,
+    summary.location,
+    summary.domain_function,
+    summary.match_confidence,
+    summary.reason_for_confidence,
+    summary.profile_overview,
+  ].filter((v) => !looksMissing(v)).length;
+
+  // Retry trigger — first match wins. Order chosen so the most informative
+  // root cause shows up in logs.
+  let weakReason: QualityAssessment["weakReason"] = null;
+  if (geminiTextEmpty) {
+    weakReason = "weak_grounding";
+  } else if (
+    confidence === "" ||
+    confidence === "low" ||
+    confidence === "not clearly found"
+  ) {
+    weakReason = "low_confidence";
+  } else if (WEAK_OVERVIEW_PHRASES.test(overview)) {
+    weakReason = "no_verified_profile";
+  } else if (
+    looksMissing(summary.education) &&
+    looksMissing(summary.previous_experience)
+  ) {
+    weakReason = "insufficient_fields";
+  } else if (populatedCount < 5) {
+    weakReason = "insufficient_fields";
+  }
+
+  return { score, populatedCount, weakReason };
+}
+
+// One end-to-end Gemini attempt: build prompt → call gemini → parse →
+// fallback → assess. Emits stages 3, 4, 9, 10 with attempt + searchStrategy
+// tags so the same requestId can show two distinct attempts in Vercel logs.
+// Stages 5–8 are emitted from inside callGemini (also tagged with the same
+// requestId).
+async function runGeminiAttempt(
+  tracker: Tracker,
+  apiKey: string,
+  parsedInput: ParsedInput,
+  strategy: SearchStrategy,
+  attempt: number,
+): Promise<AttemptOutcome> {
+  const inputCharBudget = Object.values(parsedInput).join(" ").length;
+  logStage(tracker, "3", "prompt_construction_started", {
+    attempt,
+    searchStrategy: strategy,
+    groundingEnabled: true,
+    estimatedInputLength: inputCharBudget,
+  });
+
+  let prompt: string;
+  try {
+    prompt = buildPrompt(parsedInput, strategy);
+  } catch (err) {
+    logError(tracker, "prompt_construction_failed", err, {
+      attempt,
+      searchStrategy: strategy,
+    });
+    return {
+      ok: false,
+      geminiStage: tracker.stage,
+      errorMessage: "Prompt construction failed.",
+      errorCode: "other",
+    };
+  }
+
+  logStage(tracker, "4", "prompt_construction_completed", {
+    attempt,
+    searchStrategy: strategy,
+    promptLength: prompt.length,
+    model: MODEL,
+    timeoutMs: TIMEOUT_MS,
+  });
+
+  let result: Awaited<ReturnType<typeof callGemini>>;
+  try {
+    result = await callGemini({
+      apiKey,
+      prompt,
+      // Slightly higher temperature on the retry to avoid the model running
+      // the same chain of thought and arriving at the same weak answer.
+      temperature: strategy === "expanded" ? 0.4 : 0.2,
+      tools: [{ google_search: {} }],
+      model: MODEL,
+      requestId: tracker.requestId,
+    });
+  } catch (err) {
+    logError(tracker, "gemini_helper_threw", err, {
+      attempt,
+      searchStrategy: strategy,
+    });
+    return {
+      ok: false,
+      geminiStage: tracker.stage,
+      errorMessage: "Gemini call failed.",
+      errorCode: "other",
+    };
+  }
+
+  if (!result.ok) {
+    tracker.stage = result.stage;
+    logError(tracker, "gemini_failed", new Error(result.message), {
+      attempt,
+      searchStrategy: strategy,
+      code: result.code,
+      httpStatus: result.status,
+      geminiElapsedMs: result.elapsedMs,
+    });
+    return {
+      ok: false,
+      geminiStage: result.stage,
+      errorMessage: result.message,
+      errorCode: result.code,
+    };
+  }
+
+  logStage(tracker, "9", "delimiter_parse_started", {
+    attempt,
+    searchStrategy: strategy,
+    rawTextLength: result.text.length,
+  });
+
+  const { summary: rawSummary, rawLength, separatorCount, populatedCount } =
+    parseDelimitedResponse(result.text, parsedInput.experience);
+  const { summary, fallbacksApplied } = applyHardFallbacks(
+    rawSummary,
+    parsedInput.name,
+  );
+  const assessment = assessQuality(summary, result.text === "");
+
+  logStage(tracker, "10", "delimiter_parse_completed", {
+    attempt,
+    searchStrategy: strategy,
+    rawLength,
+    separatorCount,
+    populatedCount,
+    matchConfidence: summary.match_confidence,
+    candidateQualityScore: assessment.score,
+    fallbacksApplied,
+    weakReason: assessment.weakReason ?? "none",
+  });
+
+  return { ok: true, summary, assessment, fallbacksApplied };
 }
 
 // Post-parse fill for the empty-Gemini-response case. The prompt itself
@@ -364,13 +580,31 @@ function applyHardFallbacks(
   };
 }
 
-function buildPrompt(c: {
-  name: string;
-  company: string;
-  designation: string;
-  function: string;
-  experience: string;
-}) {
+type SearchStrategy = "primary" | "expanded";
+
+function buildPrompt(
+  c: {
+    name: string;
+    company: string;
+    designation: string;
+    function: string;
+    experience: string;
+  },
+  strategy: SearchStrategy = "primary",
+) {
+  const isRetry = strategy === "expanded";
+  const secondPassBlock = isRetry
+    ? `
+SECOND-PASS DIRECTIVE (this is a retry — first attempt did not surface a strong match)
+The first attempt produced a low-confidence or sparse result. Search wider this time:
+- Try alternate query orderings: "${c.name}" "${c.designation}", "${c.name}" "${c.function}", "${c.name}" interview, "${c.name}" speaker, "${c.name}" leadership, "${c.name}" CEO, "${c.name}" founder, "${c.name}" appointment, "${c.name}" press release.
+- Try without the company qualifier first, then add it back. Try without the designation qualifier first, then add it back.
+- Try seniority terms (CEO, CFO, CTO, founder, director, head of, VP, partner) combined with the function.
+- Look beyond the first page of results — the correct profile may be lower in the rankings.
+- Specifically check: industry interviews, podcast guest pages, conference panels, speaker bios, leadership team pages on the company site, press release archives, and business directories.
+Do not return "Not clearly found" again unless you have genuinely exhausted these strategies. The same delimited 9-field output contract still applies — do not deviate from OUTPUT FORMAT.
+`
+    : "";
   return `You are an expert recruiter research assistant with access to Google Search grounding.
 
 Your job is to find the closest public profile match for the candidate described below and return a clean, structured summary. Treat the input as search guidance, not as ground truth.
@@ -391,6 +625,25 @@ Designation: ${c.designation}
 Function: ${c.function}
 Experience: ${c.experience}
 
+MULTI-RESULT EVALUATION (HIGH PRIORITY)
+Do not rely only on the first search result. Evaluate multiple public search results and identify the most likely matching profile using name, company, designation, function, experience, and contextual alignment. The correct profile may not appear in the first search result. Continue evaluating broader search results before concluding that information is unavailable.
+
+Compare candidate matches across:
+- name (allowing transliterations and short-form variants)
+- company (including aliases, parent / subsidiary names, former names)
+- designation (allowing role variants — Head of Commerce ≈ Head of SMB Growth, etc.)
+- function / domain
+- years of experience
+- geography
+- role seniority
+
+Relevant information may exist on:
+- LinkedIn, company pages, leadership / team pages
+- conference / speaker pages, interviews, podcasts, articles, PDFs
+- Reddit, public mentions, speaker bios, archived snippets
+- business directories (Crunchbase, ZoomInfo, TheOrg, RocketReach, AngelList, Bloomberg)
+- legal / public records (MCA / SEC filings, director listings, court records)
+${secondPassBlock}
 SEARCH STRATEGY
 Do not stop after the first query. Actively search using multiple combinations, including at least:
 - "${c.name}" "${c.company}"
